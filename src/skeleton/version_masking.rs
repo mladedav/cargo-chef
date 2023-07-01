@@ -173,6 +173,7 @@ struct Package {
 }
 
 fn covers(first: &str, second: &str) -> bool {
+    println!("VERSIONS: `{}` `{}`", first, second);
     // fn covers(first: &toml::Value, second: &toml::Value) -> bool {
     // let first = first.as_str().unwrap();
     // let second = second.as_str().unwrap();
