@@ -12,6 +12,7 @@ pub(super) fn mask_local_crate_versions(
     lock_file: &mut Option<toml::Value>,
 ) {
     let local_package_names = parse_local_crate_names(manifests);
+    println!("{:?}", local_package_names);
     mask_local_versions_in_manifests(manifests, &local_package_names);
     if let Some(l) = lock_file {
         mask_local_versions_in_lockfile(l, &local_package_names);
@@ -21,10 +22,7 @@ pub(super) fn mask_local_crate_versions(
 /// Dummy version used for all local crates.
 const CONST_VERSION: &str = "0.0.1";
 
-fn mask_local_versions_in_lockfile(
-    lock_file: &mut toml::Value,
-    local_package_names: &[toml::Value],
-) {
+fn mask_local_versions_in_lockfile(lock_file: &mut toml::Value, local_package_names: &[Package]) {
     if let Some(packages) = lock_file
         .get_mut("package")
         .and_then(|packages| packages.as_array_mut())
@@ -33,23 +31,42 @@ fn mask_local_versions_in_lockfile(
             .iter_mut()
             // Find all local crates
             .filter(|package| {
-                package
-                    .get("name")
-                    .map(|name| local_package_names.contains(name))
-                    .unwrap_or_default()
+                let Some(name) = package.get("name") else { return false };
+                let Some(version) = package.get("version") else { return false };
+
+                local_package_names.iter().any(|package| {
+                    &toml::Value::String(package.name.clone()) == name
+                        && covers(&package.version, version.as_str().unwrap())
+                })
             })
             // Mask the version
             .for_each(|package| {
                 if let Some(version) = package.get_mut("version") {
                     *version = toml::Value::String(CONST_VERSION.to_string())
                 }
+                if let Some(toml::Value::Array(dependencies)) = package.get_mut("dependencies") {
+                    let dependency_strings: Vec<_> = local_package_names
+                        .iter()
+                        .map(|package| format!("{} {}", package.name, package.version))
+                        .collect();
+                    for dependency in dependencies {
+                        if dependency_strings.contains(&dependency.as_str().unwrap().to_string()) {
+                            *dependency = toml::Value::String(format!(
+                                "{} {}",
+                                dependency.as_str().unwrap().split_once(' ').unwrap().0,
+                                CONST_VERSION
+                            ));
+                        }
+                    }
+                }
+                println!("{}", package);
             });
     }
 }
 
 fn mask_local_versions_in_manifests(
     manifests: &mut [ParsedManifest],
-    local_package_names: &[toml::Value],
+    local_package_names: &[Package],
 ) {
     for manifest in manifests.iter_mut() {
         if let Some(package) = manifest.contents.get_mut("package") {
@@ -63,33 +80,22 @@ fn mask_local_versions_in_manifests(
     }
 }
 
-fn mask_local_dependency_versions(
-    local_package_names: &[toml::Value],
-    manifest: &mut ParsedManifest,
-) {
-    fn _mask(local_package_names: &[toml::Value], toml_value: &mut toml::Value) {
+fn mask_local_dependency_versions(local_package_names: &[Package], manifest: &mut ParsedManifest) {
+    fn _mask(local_package_names: &[Package], toml_value: &mut toml::Value) {
         for dependency_key in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if let Some(dependencies) = toml_value.get_mut(dependency_key) {
                 if let Some(dependencies) = dependencies.as_table_mut() {
                     for (key, dependency) in dependencies {
-                        let mut must_mark_version = false;
+                        let package_name = dependency
+                            .get("package")
+                            .cloned()
+                            .unwrap_or(toml::Value::String(key.to_string()));
 
-                        if let Some(package_name) = dependency.get("package") {
-                            // We are dealing with a renamed package, so we check the name of the
-                            // "source" package.
-                            if local_package_names.contains(package_name) {
-                                must_mark_version = true;
-                            }
-                        } else {
-                            // The package has not been renamed, so we check the name of the
-                            // key in the dependencies table.
-                            if local_package_names.contains(&toml::Value::String(key.to_string())) {
-                                must_mark_version = true;
-                            }
-                        }
-
-                        if must_mark_version {
-                            if let Some(version) = dependency.get_mut("version") {
+                        if let Some(version) = dependency.get_mut("version") {
+                            if local_package_names.iter().any(|local| {
+                                package_name == toml::Value::String(local.name.clone())
+                                    && covers(&local.version, version.as_str().unwrap())
+                            }) {
                                 *version = toml::Value::String(CONST_VERSION.to_string());
                             }
                         }
@@ -143,14 +149,47 @@ fn mask_local_dependency_versions(
     }
 }
 
-fn parse_local_crate_names(manifests: &[ParsedManifest]) -> Vec<toml::Value> {
+fn parse_local_crate_names(manifests: &[ParsedManifest]) -> Vec<Package> {
     let mut local_package_names = vec![];
     for manifest in manifests.iter() {
         if let Some(package) = manifest.contents.get("package") {
-            if let Some(name) = package.get("name") {
-                local_package_names.push(name.to_owned());
+            if let (Some(toml::Value::String(name)), Some(toml::Value::String(version))) =
+                (package.get("name"), package.get("version"))
+            {
+                local_package_names.push(Package {
+                    name: name.clone(),
+                    version: version.clone(),
+                });
             }
         }
     }
     local_package_names
+}
+
+#[derive(Debug, PartialEq)]
+struct Package {
+    pub name: String,
+    pub version: String,
+}
+
+fn covers(first: &str, second: &str) -> bool {
+    // fn covers(first: &toml::Value, second: &toml::Value) -> bool {
+    // let first = first.as_str().unwrap();
+    // let second = second.as_str().unwrap();
+    let mut splits = first.split('.');
+    let first_major: u32 = splits.next().unwrap().parse().unwrap();
+    let first_minor: u32 = splits.next().unwrap().parse().unwrap();
+    let mut splits = second.split('.');
+    let second_major: u32 = splits.next().unwrap().parse().unwrap();
+    let second_minor: u32 = splits.next().unwrap().parse().unwrap();
+
+    if first_major != second_major {
+        return false;
+    }
+
+    if first_major != 0 {
+        return true;
+    }
+
+    first_minor == second_minor
 }
